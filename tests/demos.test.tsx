@@ -122,9 +122,14 @@ after(() => {
 
 /** A scripted pi engine (faux provider): the response queue replaces the old
  *  doGenerate turn counter — one queued response per model call (tool-call
- *  turn or final text), consumed in order. */
-function scriptedModel(turns: Array<{ toolCalls?: Array<{ toolCallId: string; toolName: string; input: unknown }>; text?: string }>): PiEngine {
-	const steps: FauxResponseStep[] = turns.map((step) => {
+ *  turn or final text), consumed in order. `onCall` records the prompt each
+ *  call received (the demo/visual retry feedback assertions). */
+function scriptedModel(
+	turns: Array<{ toolCalls?: Array<{ toolCallId: string; toolName: string; input: unknown }>; text?: string }>,
+	onCall?: (context: { messages: Array<{ content: unknown }> }) => void,
+): PiEngine {
+	const steps: FauxResponseStep[] = turns.map((step) => (context) => {
+		onCall?.(context as { messages: Array<{ content: unknown }> });
 		if (step.toolCalls) {
 			return fauxAssistantMessage(
 				step.toolCalls.map((c) => fauxToolCall(c.toolName, c.input as ToolCall["arguments"], { id: c.toolCallId })),
@@ -647,11 +652,42 @@ describe("demo builder (fake model + fake headless)", () => {
 			{ toolCalls: [{ toolCallId: "w1", toolName: "write_demo", input: { html: BROKEN_HTML } }] },
 			{ text: "It works, trust me." },
 		]);
-		const result = await runDemoBuilder({ title: "T", brief: "b" }, { engine: model, headless });
+		const result = await runDemoBuilder({ title: "T", brief: "b" }, { engine: model, headless, maxAttempts: 1 });
 		assert.equal(result.html, "");
 		assert.equal(result.tested, true, "the loop ran");
 		assert.match(result.notes ?? "", /^FAILED:/);
 		assert.match(result.notes ?? "", /ReferenceError/);
+	});
+
+	it("retries a failed build, feeds the failure + broken HTML back, and delivers attempt 2", async () => {
+		const headless = fakeHeadless({ brokenWhenIncludes: "BROKEN" });
+		const prompts: string[] = [];
+		const model = scriptedModel(
+			[
+				// Attempt 1: writes a broken demo, then claims success. The final
+				// verify gate catches the console error.
+				{ toolCalls: [{ toolCallId: "w1", toolName: "write_demo", input: { html: BROKEN_HTML } }] },
+				{ text: "It works, trust me." },
+				// Attempt 2: the retry produces a clean demo.
+				{ toolCalls: [{ toolCallId: "w2", toolName: "write_demo", input: { html: GOOD_HTML } }] },
+				{ toolCalls: [{ toolCallId: "r2", toolName: "run_demo", input: {} }] },
+				{ text: "Sweep the slider." },
+			],
+			(ctx) => prompts.push(ctx.messages.map((m) => JSON.stringify(m.content)).join("\n")),
+		);
+		const activities: string[] = [];
+		const result = await runDemoBuilder(
+			{ title: "T", brief: "b" },
+			{ engine: model, headless, onActivity: (line) => activities.push(line) },
+		);
+
+		assert.equal(result.html, GOOD_HTML, "attempt 2 is delivered");
+		assert.equal(result.notes, "Sweep the slider.");
+		assert.ok(activities.some((a) => a.startsWith("retry 2/3")), `retry activity: ${activities.join(" | ")}`);
+		const retryPrompt = prompts.slice(2).join("\n");
+		assert.match(retryPrompt, /A PREVIOUS ATTEMPT FAILED|Failure:/, "the retry prompt carries the failure");
+		assert.match(retryPrompt, /ReferenceError/, "the headless console error is fed back");
+		assert.match(retryPrompt, /Previous HTML/, "the failing document is fed back");
 	});
 
 	it("fails fast with a clear message when no Chrome is available (never skips testing)", async () => {
@@ -663,7 +699,7 @@ describe("demo builder (fake model + fake headless)", () => {
 
 	it("fails when the model never writes a demo", async () => {
 		const model = scriptedModel([{ text: "I cannot build this." }]);
-		const result = await runDemoBuilder({ title: "T", brief: "b" }, { engine: model, headless: fakeHeadless() });
+		const result = await runDemoBuilder({ title: "T", brief: "b" }, { engine: model, headless: fakeHeadless(), maxAttempts: 1 });
 		assert.equal(result.html, "");
 		assert.match(result.notes ?? "", /^FAILED: the builder never wrote a demo/);
 	});
@@ -774,9 +810,31 @@ describe("visual maker (fake model + fake headless)", () => {
 
 	it("fails when the model never writes an svg", async () => {
 		const model = scriptedModel([{ text: "This idea is purely relational — belongs in mermaid." }]);
-		const result = await runVisualMaker({ brief: "b" }, { engine: model, headless: fakeHeadless() });
+		const result = await runVisualMaker({ brief: "b" }, { engine: model, headless: fakeHeadless(), maxAttempts: 1 });
 		assert.equal(result.svg, "");
 		assert.match(result.notes ?? "", /^FAILED: the maker never wrote an SVG/);
+	});
+
+	it("retries a failed figure, feeds the failure back, and delivers attempt 2", async () => {
+		const prompts: string[] = [];
+		const model = scriptedModel(
+			[
+				// Attempt 1: no SVG at all.
+				{ text: "This idea is purely relational — belongs in mermaid." },
+				// Attempt 2: a proper write → render → finish.
+				{ toolCalls: [{ toolCallId: "w2", toolName: "write_svg", input: { svg: SVG_1 } }] },
+				{ toolCalls: [{ toolCallId: "r2", toolName: "render_svg", input: {} }] },
+				{ text: "A number line from -3 to 3." },
+			],
+			(ctx) => prompts.push(ctx.messages.map((m) => JSON.stringify(m.content)).join("\n")),
+		);
+		const result = await runVisualMaker({ brief: "b" }, { engine: model, headless: fakeHeadless() });
+
+		assert.equal(result.svg, SVG_1, "attempt 2 is delivered");
+		assert.equal(result.notes, "A number line from -3 to 3.");
+		const retryPrompt = prompts.slice(1).join("\n");
+		assert.match(retryPrompt, /Failure: FAILED: the maker never wrote an SVG/, "the retry prompt names the failure");
+		assert.match(retryPrompt, /FIRST action must be write_svg/, "the retry prompt gives the corrective instruction");
 	});
 
 	it("fails with a clear message when no Chrome is available", async () => {
@@ -919,7 +977,8 @@ describe("demo/visual job runners", () => {
 		const job = jobStore.createJob({ kind: "visual", chatId: chat.id, toolCallId: "call-v1" });
 		createdJobs.push(job.id);
 
-		visualModelOverride.current = scriptedModel([{ text: "cannot" }]);
+		// Three attempts: the default retry budget consumes one response each.
+		visualModelOverride.current = scriptedModel([{ text: "cannot" }, { text: "cannot" }, { text: "cannot" }]);
 		const { steers, runner } = testRunner();
 		try {
 			await runner.runJob(job.id);
@@ -935,6 +994,7 @@ describe("demo/visual job runners", () => {
 		const result = (steers[0]!.details as { result: unknown }).result as { svg: string; notes?: string };
 		assert.equal(result.svg, "");
 		assert.match(result.notes ?? "", /^FAILED:/);
+		assert.match(result.notes ?? "", /Gave up after 3 attempts/);
 	});
 
 	it("dispatch through a teacher turn: the call acks mid-turn and the runner completes in the background", async () => {

@@ -23,6 +23,7 @@ import { createReadTool, readTool } from "./tools/read.ts";
 import { quizInputObject, quizInputProblems } from "../core/question-core.ts";
 import { QUESTION_TOOLS, TOGGLEABLE_TOOLS, type EnabledTools } from "../core/pending.ts";
 import type { PluginToolContext } from "../core/plugins.ts";
+import { newContinuationMessage, prematureStopOf, type PrematureStop } from "../core/native-messages.ts";
 import { toLlmMessages, nativeInputCause, PRACTICE_PROBLEM_TOOL } from "../core/native-messages.ts";
 import type { ChatGPTRequestCycle } from "./chatgpt-request-cycle.ts";
 import { usageWasAdmitted } from "./subscription-request-cycle.ts";
@@ -241,6 +242,16 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 	// the normal no-observer path (tests, env-off).
 	const providerEvents = opts.chatId ? providerEventObserver(opts.chatId, kind) : undefined;
 	const seenInputs = new Set((opts.messages ?? []).map((m) => (m as { id?: string }).id).filter(Boolean));
+	// PREMATURE-STOP RECOVERY (2026-11, the planning-stage stall): a provider
+	// that cuts an answer at its output limit ends pi's loop with stopReason
+	// "length"; a thinking-only/blank answer ends it with no text and no tool
+	// calls. Both used to end the turn mid-thought — the learner had to type
+	// "resume" over and over. Instead, ask pi for explicit continuations and
+	// inject one model-facing note per gap, bounded so a permanently broken
+	// provider still ends the turn.
+	const MAX_CONTINUATIONS = 4;
+	let continuations = 0;
+	let pendingContinuation: PrematureStop | null = null;
 	const agent = new Agent({
 		identity: APP_IDENTITY,
 		sessionId: opts.chatId,
@@ -269,7 +280,31 @@ function baseAgentOptions(kind: AgentKind, opts: AgentBuildOptions, tools: Agent
 		// exits BEFORE the steering poll — the parked-marker stranding our
 		// Wave C registerLiveAgent-before-runPiTurn design depends on.
 		// undefined preserves normal scheduling (the old boolean false).
-		finishTurn: (turn) => (turn.toolResults.some(result => questionLedger?.isAcknowledgment(result) || (kind === "practice" && isPluginProblemPoseAcknowledgment(result))) || stopper(turn) ? { action: "end" } : undefined),
+		finishTurn: (turn) => {
+			if (turn.toolResults.some(result => questionLedger?.isAcknowledgment(result) || (kind === "practice" && isPluginProblemPoseAcknowledgment(result))) || stopper(turn)) {
+				return { action: "end" };
+			}
+			const premature = prematureStopOf(turn.message);
+			if (premature !== null && continuations < MAX_CONTINUATIONS) {
+				continuations++;
+				pendingContinuation = premature;
+				return { action: "continue" };
+			}
+			if (premature !== null) {
+				console.warn(
+					`[${kind}] response still ${premature} after ${MAX_CONTINUATIONS} continuations — ending the turn`,
+				);
+			}
+			return undefined;
+		},
+		// The continuation note rides the next request only; it is emitted
+		// like any marker so the record stays replayable, and the view drops
+		// it (customType "continuation" has no projection case).
+		prepareNextTurn: () => {
+			const reason = pendingContinuation;
+			pendingContinuation = null;
+			return reason ? { messages: [newContinuationMessage(reason)] } : undefined;
+		},
 		// Wave C (2026-09-26, owner correction same day): markers handed to a
 		// live run drain from pi's STEERING queue — the lesson loop is one
 		// continuous teach→quiz→teach run, so delivery must inject at turn

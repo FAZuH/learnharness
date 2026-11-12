@@ -36,6 +36,11 @@ export interface DemoBuilderOptions {
 	headless?: HeadlessApi;
 	/** Max agent steps (each write/run/fix is one step). Default 24 ≈ 6 cycles. */
 	maxSteps?: number;
+	/** Total build attempts when the result is a failure (no HTML written or
+	 *  the final headless verification failed). Each retry starts a fresh
+	 *  conversation carrying the previous failure back to the builder.
+	 *  Default 3; headless-unavailable and aborted runs never retry. */
+	maxAttempts?: number;
 	/** Live activity-line callback (updates the job record). */
 	onActivity?: (line: string) => void;
 	/** Kills the run mid-model-call (2026-09 real-kill abort semantics). */
@@ -185,12 +190,65 @@ export async function runDemoBuilder(input: DemoBuilderInput, opts: DemoBuilderO
 	const headless = opts.headless ?? getHeadless();
 	const title = input.title.trim() || "Interactive demo";
 	const brief = input.brief.trim() || "(no brief)";
-	const notes = (text: string) => (text.trim() ? text.trim() : undefined);
+	const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
 
 	const reason = headless.unavailableReason();
 	if (reason) {
 		return { title, html: "", tested: true, notes: `FAILED: ${reason}` };
 	}
+
+	const failures: string[] = [];
+	let feedback: string | undefined;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		const outcome = await attemptDemoBuilder({ title, brief }, opts, headless, feedback);
+		if (outcome.result.html.length > 0) {
+			return attempt === 1
+				? outcome.result
+				: { ...outcome.result, notes: outcome.result.notes ?? `Built on attempt ${attempt} of ${maxAttempts}.` };
+		}
+		failures.push(outcome.result.notes ?? "unknown failure");
+		// A retry cannot fix a missing browser or a learner abort.
+		if (!outcome.retryable || attempt === maxAttempts || opts.abortSignal?.aborted) {
+			return failures.length === 1
+				? outcome.result
+				: {
+						...outcome.result,
+						notes:
+							`${outcome.result.notes ?? "FAILED: the demo could not be built."}\n\n` +
+							`Gave up after ${attempt} attempts. Earlier failures:\n` +
+							failures
+								.slice(0, -1)
+								.map((failure, index) => `${index + 1}. ${failure}`)
+								.join("\n"),
+					};
+		}
+		opts.onActivity?.(`retry ${attempt + 1}/${maxAttempts}: ${firstLine(outcome.result.notes ?? "failed")}`);
+		feedback = demoRetryFeedback(outcome.result.notes ?? "", outcome.failureHtml);
+	}
+
+	// Unreachable: the loop always returns on the last attempt.
+	return { title, html: "", tested: true, notes: "FAILED: the demo could not be built." };
+}
+
+/** One complete builder attempt. `failureHtml` is whatever the model wrote
+ *  before the attempt failed (null = it never wrote) — the retry prompt
+ *  shows it back to the model so the next attempt fixes real code instead
+ *  of guessing. */
+interface DemoAttemptOutcome {
+	result: DemoResult;
+	failureHtml: string | null;
+	retryable: boolean;
+}
+
+async function attemptDemoBuilder(
+	input: DemoBuilderInput,
+	opts: DemoBuilderOptions,
+	headless: HeadlessApi,
+	feedback: string | undefined,
+): Promise<DemoAttemptOutcome> {
+	const title = input.title;
+	const brief = input.brief;
+	const notes = (text: string) => (text.trim() ? text.trim() : undefined);
 
 	const state: BuilderState = { html: null, testedHtml: null, lastResult: null };
 
@@ -198,9 +256,12 @@ export async function runDemoBuilder(input: DemoBuilderInput, opts: DemoBuilderO
 		`Demo title: ${title}`,
 		`Brief (all you know about the lesson — this comes from the teacher, verbatim):`,
 		brief,
+		feedback ? `Retry context — a previous attempt failed:\n${feedback}` : null,
 		"",
 		"Build the demo, test it with run_demo, iterate until PASSED, then finish with your notes.",
-	].join("\n");
+	]
+		.filter((line): line is string => line !== null)
+		.join("\n");
 
 	let finalText = "";
 	try {
@@ -218,16 +279,24 @@ export async function runDemoBuilder(input: DemoBuilderInput, opts: DemoBuilderO
 		finalText = result.text;
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
-		return { title, html: "", tested: true, notes: `FAILED: the builder crashed — ${msg}` };
+		return {
+			result: { title, html: "", tested: true, notes: `FAILED: the builder crashed — ${msg}` },
+			failureHtml: state.html,
+			retryable: !opts.abortSignal?.aborted,
+		};
 	}
 
 	// The model produced nothing.
 	if (!state.html) {
 		return {
-			title,
-			html: "",
-			tested: true,
-			notes: `FAILED: the builder never wrote a demo.${finalText ? ` (${finalText.slice(0, 300)})` : ""}`,
+			result: {
+				title,
+				html: "",
+				tested: true,
+				notes: `FAILED: the builder never wrote a demo.${finalText ? ` (${finalText.slice(0, 300)})` : ""}`,
+			},
+			failureHtml: null,
+			retryable: true,
 		};
 	}
 
@@ -240,18 +309,53 @@ export async function runDemoBuilder(input: DemoBuilderInput, opts: DemoBuilderO
 			verify = await headless.runDemo(state.html);
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			return { title, html: "", tested: true, notes: `FAILED: final verification crashed — ${msg}` };
+			return {
+				result: { title, html: "", tested: true, notes: `FAILED: final verification crashed — ${msg}` },
+				failureHtml: state.html,
+				retryable: !opts.abortSignal?.aborted,
+			};
 		}
 		state.lastResult = verify;
 		if (!verify.ok) {
 			return {
-				title,
-				html: "",
-				tested: true,
-				notes: `FAILED: the demo never passed headless verification (${failureSummary(verify)}).`,
+				result: {
+					title,
+					html: "",
+					tested: true,
+					notes: `FAILED: the demo never passed headless verification (${failureSummary(verify)}).`,
+				},
+				failureHtml: state.html,
+				retryable: true,
 			};
 		}
 	}
 
-	return { title, html: state.html, tested: true, notes: notes(finalText) };
+	return { result: { title, html: state.html, tested: true, notes: notes(finalText) }, failureHtml: null, retryable: true };
+}
+
+/** The retry prompt's failure block: what went wrong, the class-specific
+ *  corrective instruction, and (when one existed) the failed document. */
+function demoRetryFeedback(notes: string, html: string | null): string {
+	const lines = [
+		`Failure: ${notes}`,
+		"Diagnose this before writing. Do not resubmit the same document unchanged.",
+	];
+	if (/never wrote a demo/i.test(notes)) {
+		lines.push(
+			"Your FIRST action must be write_demo with the complete single-file HTML document. A prose-only reply is a failure.",
+		);
+	} else if (/never passed headless verification|final verification crashed|headless error/i.test(notes)) {
+		lines.push(
+			"The HTML failed the headless browser check. Fix the exact errors above, then call write_demo and run_demo again.",
+		);
+	}
+	if (html && html.trim()) {
+		const shown = html.length > 12_000 ? `${html.slice(0, 12_000)}\n… [truncated]` : html;
+		lines.push(`Previous HTML (fix or replace it — it failed):\n\`\`\`html\n${shown}\n\`\`\``);
+	}
+	return lines.join("\n\n");
+}
+
+function firstLine(text: string): string {
+	return (text.split("\n")[0] ?? "").slice(0, 120);
 }

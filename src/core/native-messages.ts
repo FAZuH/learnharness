@@ -82,6 +82,7 @@ export interface LhMarkerMessage {
 		| "plugin-problem-submission"
 		| "practice-next"
 		| "problem-dismissed"
+		| "continuation"
 		| "compaction"
 		| "side-question"
 		| "side-question-told";
@@ -238,6 +239,28 @@ export function newUserMessage(text: string, images?: readonly ImageContent[]): 
  *  upsert by one identity. */
 export function newUserSteer(text: string, id: string, images?: readonly ImageContent[]): LhMessage & UserMessage {
 	return { id, role: "user", content: nativeInlineImageContent(text, images), timestamp: Date.now() };
+}
+
+/** The output-recovery continuation note: a model-facing nudge appended
+ *  after a response that stopped prematurely (output limit or empty
+ *  completion). The marker is NOT learner-facing (display: false, no
+ *  projection case) — the transcript shows nothing, but the model reads
+ *  it as the next user-side instruction and continues exactly where it
+ *  stopped. `details.reason` keeps the cause debuggable. */
+export function newContinuationMessage(reason: PrematureStop): LhMarkerMessage {
+	const content =
+		reason === "length"
+			? "Your previous response hit the provider's output token limit before delivering a complete answer. If you already wrote part of the answer, continue from exactly where it stopped — do not repeat it or restart. If you produced no visible text at all, your entire output budget went to internal reasoning: stop reasoning and write the learner-facing answer now. If a tool call was cut off, re-issue it with complete arguments."
+			: "Your previous response was empty. Continue now: write the learner-facing explanation the turn owes, or call the next tool. Never return an empty response.";
+	return {
+		id: newMessageId(),
+		role: "custom",
+		customType: "continuation",
+		content,
+		display: false,
+		details: { reason },
+		timestamp: Date.now(),
+	};
 }
 
 /** The learner's answer — the question call's tool result (fork 1).
@@ -928,8 +951,47 @@ export function answeredCallIds(messages: readonly LhMessage[]): Set<string> {
 	return resultIdsFrom(messages);
 }
 
+// ─── output-limit / empty-response recovery ─────────────────────────────────
+
+/** Why a completed model response was not a real completion:
+ *  "length" = the provider cut it at the output token limit; "empty" = the
+ *  model stopped with no learner-facing text and no tool calls (a
+ *  thinking-only or blank turn). */
+export type PrematureStop = "length" | "empty";
+
+/** Classify a settled assistant message. Only completed stops qualify:
+ *  error/aborted responses are hard exits (pi never honors a continue
+ *  decision for them) and are owned by the failure/abort paths. A message
+ *  with a tool call still has work for the loop, so it is not premature —
+ *  even when its visible text is empty. */
+export function prematureStopOf(message: {
+	stopReason?: string;
+	content?: unknown;
+}): PrematureStop | null {
+	if (message.stopReason === "length") return "length";
+	if (message.stopReason !== "stop" && message.stopReason !== "toolUse") return null;
+	const content = message.content;
+	if (!Array.isArray(content)) return "empty";
+	const hasText = content.some(
+		(block) =>
+			block !== null &&
+			typeof block === "object" &&
+			(block as { type?: unknown }).type === "text" &&
+			typeof (block as { text?: unknown }).text === "string" &&
+			(block as { text: string }).text.trim().length > 0,
+	);
+	const hasToolCall = content.some(
+		(block) =>
+			block !== null &&
+			typeof block === "object" &&
+			(block as { type?: unknown }).type === "toolCall",
+	);
+	return hasText || hasToolCall ? null : "empty";
+}
+
 // ─── the continuation fold (Wave D: the SDK's
 //     lastAssistantMessageIsCompleteWithToolCalls, natively) ──────────────────
+
 
 /**
  * Does the record END on un-consumed tool results — a turn that stopped
@@ -988,7 +1050,7 @@ export function nativeInputCause(message: AgentMessage, history: readonly AgentM
 	if (message.role === "custom") {
 		if (["probe-handoff", "subagent-steer", "subagent-abort"].includes(message.customType)) return "automatic";
 		if (["practice-thinking", "plugin-problem-submission", "practice-next"].includes(message.customType)) return "learner";
-		return ["graph-context", "plan-block", "problem-dismissed", "compaction", "side-question", "side-question-told"].includes(message.customType) ? "neutral" : "unrecognizable";
+		return ["graph-context", "plan-block", "problem-dismissed", "continuation", "compaction", "side-question", "side-question-told"].includes(message.customType) ? "neutral" : "unrecognizable";
 	}
 	if (message.role === "toolResult") {
 		const pluginAnswer = readPluginQuestionAnswer(message.details);

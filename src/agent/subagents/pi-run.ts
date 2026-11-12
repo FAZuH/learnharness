@@ -6,6 +6,7 @@ import { usageWasAdmitted } from "../subscription-request-cycle.ts";
 import { workerRequestStream } from "../worker-request-admission.ts";
 import { providerEventObserver } from "../provider-events.ts";
 import { backgroundCaptureStream, createBackgroundCapture } from "../background-capture.ts";
+import { newContinuationMessage, prematureStopOf, type PrematureStop } from "../../core/native-messages.ts";
 import type { ModelRole } from "../../../config.ts";
 
 /**
@@ -76,6 +77,12 @@ export async function runSubagent(tools: AgentTool<any, any>[], opts: SubagentRu
 	if (opts.abortSignal?.aborted) throw Object.assign(new Error("aborted"), { name: "AbortError" });
 	const engine = subagentEngine(opts.role, opts.engine);
 	let turns = 0;
+	// Premature-stop recovery (same law as the teacher): a sub-agent whose
+	// answer hits the output limit or comes back blank gets bounded explicit
+	// continuations instead of ending with an empty deliverable.
+	const MAX_CONTINUATIONS = 4;
+	let continuations = 0;
+	let pendingContinuation: PrematureStop | null = null;
 	// Debug recorder (owner, 2026-10-04): raw provider events per job run.
 	const providerEvents = opts.chatId && opts.role ? providerEventObserver(opts.chatId, `job:${opts.role}`) : undefined;
 	const sessionId = randomUUID();
@@ -106,9 +113,26 @@ export async function runSubagent(tools: AgentTool<any, any>[], opts: SubagentRu
 		// exits before the steering poll, exactly the old boolean-true).
 		finishTurn: (turn) => {
 			turns++;
-			return turns >= opts.maxTurns || opts.shouldStop?.(turn.message, turn.toolResults) === true
-				? { action: "end" }
-				: undefined;
+			if (turns >= opts.maxTurns || opts.shouldStop?.(turn.message, turn.toolResults) === true) {
+				return { action: "end" };
+			}
+			const premature = prematureStopOf(turn.message);
+			if (premature !== null && continuations < MAX_CONTINUATIONS) {
+				continuations++;
+				pendingContinuation = premature;
+				return { action: "continue" };
+			}
+			if (premature !== null) {
+				console.warn(
+					`[${opts.role}] response still ${premature} after ${MAX_CONTINUATIONS} continuations — ending the run`,
+				);
+			}
+			return undefined;
+		},
+		prepareNextTurn: () => {
+			const reason = pendingContinuation;
+			pendingContinuation = null;
+			return reason ? { messages: [newContinuationMessage(reason)] } : undefined;
 		},
 	});
 

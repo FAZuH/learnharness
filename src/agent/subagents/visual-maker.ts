@@ -57,6 +57,10 @@ export interface VisualMakerOptions {
 	headless?: HeadlessApi;
 	/** Max model rounds (write/render cycles + final answer). Default 8. */
 	maxIterations?: number;
+	/** Total maker attempts when no verified SVG is produced. Each retry is
+	 *  a fresh conversation carrying the previous failure (and failing SVG)
+	 *  back to the model. Default 3; aborted runs never retry. */
+	maxAttempts?: number;
 	/** Live activity-line callback (updates the job record). */
 	onActivity?: (line: string) => void;
 	/** Kills the run mid-model-call (2026-09 real-kill abort semantics). */
@@ -164,12 +168,59 @@ const UNLOOKED_FINISH_MESSAGE =
 export async function runVisualMaker(input: VisualMakerInput, opts: VisualMakerOptions = {}): Promise<VisualResult> {
 	const headless = opts.headless ?? getHeadless();
 	const brief = input.brief.trim() || "(no brief)";
-	const maxIterations = opts.maxIterations ?? 8;
+	const maxAttempts = Math.max(1, opts.maxAttempts ?? 3);
 
 	const reason = headless.unavailableReason();
 	if (reason) {
 		return { svg: "", notes: `FAILED: ${reason}` };
 	}
+
+	const failures: string[] = [];
+	let feedback: string | undefined;
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		const outcome = await attemptVisualMaker({ brief, image: input.image }, opts, headless, feedback);
+		if (outcome.result.svg.length > 0) {
+			return attempt === 1
+				? outcome.result
+				: { ...outcome.result, notes: outcome.result.notes ?? `Made on attempt ${attempt} of ${maxAttempts}.` };
+		}
+		failures.push(outcome.result.notes ?? "unknown failure");
+		if (!outcome.retryable || attempt === maxAttempts || opts.abortSignal?.aborted) {
+			return failures.length === 1
+				? outcome.result
+				: {
+						...outcome.result,
+						notes:
+							`${outcome.result.notes ?? "FAILED: the figure could not be made."}\n\n` +
+							`Gave up after ${attempt} attempts. Earlier failures:\n` +
+							failures
+								.slice(0, -1)
+								.map((failure, index) => `${index + 1}. ${failure}`)
+								.join("\n"),
+					};
+		}
+		opts.onActivity?.(`retry ${attempt + 1}/${maxAttempts}: ${firstLine(outcome.result.notes ?? "failed")}`);
+		feedback = visualRetryFeedback(outcome.result.notes ?? "", outcome.failureSvg);
+	}
+
+	// Unreachable: the loop always returns on the last attempt.
+	return { svg: "", notes: "FAILED: the figure could not be made." };
+}
+
+interface VisualAttemptOutcome {
+	result: VisualResult;
+	failureSvg: string | null;
+	retryable: boolean;
+}
+
+async function attemptVisualMaker(
+	input: VisualMakerInput,
+	opts: VisualMakerOptions,
+	headless: HeadlessApi,
+	feedback: string | undefined,
+): Promise<VisualAttemptOutcome> {
+	const brief = input.brief;
+	const maxIterations = opts.maxIterations ?? 8;
 
 	const tools = createVisualTools();
 	const toolDeclarations = Object.values(tools);
@@ -187,21 +238,23 @@ export async function runVisualMaker(input: VisualMakerInput, opts: VisualMakerO
 			? "Brief for ONE annotated image (from the teacher, verbatim — it is everything you know):"
 			: "Brief for ONE precise figure (from the teacher, verbatim — it is everything you know):",
 		brief,
-		"",
+		feedback ? `Retry context — a previous attempt failed:\n${feedback}` : null,
 		...(learnerImage
 			? [
 					`The learner's image follows: ${learnerImage.width}×${learnerImage.height} px. Place it with <image href="${LEARNER_IMAGE_HREF}" … width="${learnerImage.width}" height="${learnerImage.height}"/>.`,
 				]
 			: []),
 		"Author the SVG, render it, look at it, iterate until correct, then finish with your notes.",
-	].join("\n");
+	]
+		.filter((line): line is string => line !== null)
+		.join("\n");
 
 	let messages: Message[] = [{ role: "user", content: prompt, timestamp: Date.now() }];
 	if (learnerImage) {
 		const shown = await processImage(Buffer.from(learnerImage.data, "base64"), learnerImage.mimeType, {
 			resizeOptions: engine.model.inputLimits?.images?.resize,
 		});
-		if (!shown.ok) return { svg: "", notes: `FAILED: showing the learner's image to the maker failed — ${shown.message}` };
+		if (!shown.ok) return { result: { svg: "", notes: `FAILED: showing the learner's image to the maker failed — ${shown.message}` }, failureSvg: null, retryable: true };
 		messages = [
 			{
 				role: "user",
@@ -263,11 +316,11 @@ export async function runVisualMaker(input: VisualMakerInput, opts: VisualMakerO
 						png = await render(currentSvg);
 					} catch (err) {
 						const msg = err instanceof Error ? err.message : String(err);
-						return { svg: "", notes: `FAILED: rendering the final SVG failed — ${msg}` };
+						return { result: { svg: "", notes: `FAILED: rendering the final SVG failed — ${msg}` }, failureSvg: currentSvg, retryable: true };
 					}
 					const image = await processImage(png, "image/png", { resizeOptions: engine.model.inputLimits?.images?.resize });
 					opts.abortSignal?.throwIfAborted();
-					if (!image.ok) return { svg: "", notes: `FAILED: inspecting the final SVG failed — ${image.message}` };
+					if (!image.ok) return { result: { svg: "", notes: `FAILED: inspecting the final SVG failed — ${image.message}` }, failureSvg: currentSvg, retryable: true };
 					opts.onActivity?.("render_svg: inspecting final render");
 					renderedSvg = currentSvg;
 					messages = [
@@ -283,7 +336,7 @@ export async function runVisualMaker(input: VisualMakerInput, opts: VisualMakerO
 					];
 					continue;
 				}
-				return finish(currentSvg, finalText, learnerImage);
+				return { result: finish(currentSvg, finalText, learnerImage), failureSvg: null, retryable: true };
 			}
 
 			const toolResults: ToolResultMessage[] = [];
@@ -382,16 +435,49 @@ export async function runVisualMaker(input: VisualMakerInput, opts: VisualMakerO
 	} catch (err) {
 		captureError = err;
 		const msg = err instanceof Error ? err.message : String(err);
-		return { svg: "", notes: `FAILED: the maker crashed — ${msg}` };
+		return { result: { svg: "", notes: `FAILED: the maker crashed — ${msg}` }, failureSvg: currentSvg, retryable: !opts.abortSignal?.aborted };
 	} finally {
 		capture?.finish(captureError);
 	}
 
 	// Iteration limit: deliver the last written SVG only if it was looked at.
 	if (currentSvg && renderedSvg === currentSvg) {
-		return finish(currentSvg, finalText || "Iteration limit reached — delivering the last verified SVG.", learnerImage);
+		return {
+			result: finish(currentSvg, finalText || "Iteration limit reached — delivering the last verified SVG.", learnerImage),
+			failureSvg: null,
+			retryable: true,
+		};
 	}
-	return { svg: "", notes: `FAILED: iteration limit (${maxIterations}) reached without a verified SVG.` };
+	return {
+		result: { svg: "", notes: `FAILED: iteration limit (${maxIterations}) reached without a verified SVG.` },
+		failureSvg: currentSvg,
+		retryable: true,
+	};
+}
+
+/** The retry prompt's failure block: what went wrong, the class-specific
+ *  corrective instruction, and (when one existed) the failed SVG. */
+function visualRetryFeedback(notes: string, svg: string | null): string {
+	const lines = [
+		`Failure: ${notes}`,
+		"Diagnose this before drawing. Do not resubmit the same SVG unchanged.",
+	];
+	if (/never wrote an SVG/i.test(notes)) {
+		lines.push("Your FIRST action must be write_svg with the complete <svg>…</svg> document. A prose-only reply is a failure.");
+	} else if (/iteration limit/i.test(notes)) {
+		lines.push("You ran out of rounds without a verified final render. Write a complete SVG, call render_svg, look at the PNG, fix it, and render once more before finishing.");
+	} else if (/render|RENDER ERROR|malformed/i.test(notes)) {
+		lines.push("The SVG did not rasterize. Fix the XML/geometry errors, then render and inspect the result.");
+	}
+	if (svg && svg.trim()) {
+		const shown = svg.length > 12_000 ? `${svg.slice(0, 12_000)}\n… [truncated]` : svg;
+		lines.push(`Previous SVG (fix or replace it — it failed):\n\`\`\`svg\n${shown}\n\`\`\``);
+	}
+	return lines.join("\n\n");
+}
+
+function firstLine(text: string): string {
+	return (text.split("\n")[0] ?? "").slice(0, 120);
 }
 
 function toolText(toolCallId: string, toolName: string, value: string): ToolResultMessage {
