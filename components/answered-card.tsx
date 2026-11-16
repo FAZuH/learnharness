@@ -10,7 +10,7 @@ import { PathText } from "@/components/file-path-chip";
 import { cn } from "@/lib/utils";
 import { ToolContentResponse } from "@/components/ai-elements/message";
 import type { QuestionAnswerData } from "@/src/core";
-import { answerForPresentation, parseAskInput, parseQuizInput } from "@/src/core";
+import { CONFIDENT_ANSWER_MIN, answerForPresentation, parseAskInput, parseQuizInput } from "@/src/core";
 
 /**
  * Static rendering of an answered question (tool part in `output-available`).
@@ -46,6 +46,23 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 	const askInput = answer.kind === "ask" ? parseAskInput(input) : undefined;
 	const parsedDetails = askInput?.details ?? (answer.kind === "quiz" ? parseQuizInput(input)?.details : undefined);
 	const descByIndex = new Map((askInput?.options ?? []).map((o, i) => [i + 1, o.description]));
+
+	// Per-option notes authored at pose time, keyed by option value.
+	type OptionFeedbackBlock = { value: string; kind: "wrong" | "right"; label: string; text: string };
+	const optionFeedback: OptionFeedbackBlock[] = isQuiz
+		? answer.answers.flatMap((a): OptionFeedbackBlock[] => {
+			const entry = answer.optionFeedback?.find((f) => f.value === a.value);
+			if (!entry) return [];
+			if (correctIdx.has(a.index)) {
+				return (answer.confidence ?? 0) >= CONFIDENT_ANSWER_MIN && entry.right
+					? [{ value: a.value, kind: "right", label: "What you just learned", text: entry.right }]
+					: [];
+			}
+			return entry.wrong
+				? [{ value: a.value, kind: "wrong", label: "Why not this", text: entry.wrong }]
+				: [];
+		})
+		: [];
 
 	return (
 		<>
@@ -159,6 +176,22 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 							<span>“<PathText text={answer.other} />”</span>
 						</div>
 					)}
+				</div>
+			)}
+
+			{optionFeedback.length > 0 && (
+				<div className="mt-3 flex flex-col gap-2">
+					{optionFeedback.map((f) => (
+						<div
+							key={f.value}
+							data-testid="option-feedback"
+							data-feedback-kind={f.kind}
+							className="rounded-lg bg-muted py-2 text-sm text-foreground/70"
+						>
+							<span className="font-medium text-muted-foreground">{f.label} </span>
+							<ToolContentResponse className="inline [&>p:first-child]:inline [&>p:first-child]:m-0">{f.text}</ToolContentResponse>
+						</div>
+					))}
 				</div>
 			)}
 
