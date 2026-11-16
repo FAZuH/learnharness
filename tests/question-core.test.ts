@@ -68,9 +68,10 @@ describe("the schema's argument order (reasoning before the pick)", () => {
 				keys.indexOf("explanation") < keys.indexOf("correctAnswer"),
 				`explanation must precede correctAnswer in the emitted schema (got: ${keys.join(", ")})`,
 			);
+			// optionFeedback sits next to options so it is authored with them.
 			assert.deepEqual(keys, schema === quizInputSchema
-				? ["type", "nodeId", "question", "options", "multiSelect", "explanation", "correctAnswer", "details"]
-				: ["question", "options", "multiSelect", "explanation", "correctAnswer", "details"]);
+				? ["type", "nodeId", "question", "options", "optionFeedback", "multiSelect", "explanation", "correctAnswer", "details"]
+				: ["question", "options", "optionFeedback", "multiSelect", "explanation", "correctAnswer", "details"]);
 		}
 	});
 });
@@ -155,6 +156,63 @@ describe("quizInputSchema / quizInputProblems (the authoring contract)", () => {
 		assert.equal(boundaryOk(quizInputSchema, { ...valid, correctAnswer: "" }, quizInputProblems({ ...valid, correctAnswer: "" })), false);
 		assert.equal(boundaryOk(quizInputSchema, { ...valid, correctAnswer: "[]" }, quizInputProblems({ ...valid, correctAnswer: "[]" })), false);
 		assert.match(quizInputProblems({ ...valid, correctAnswer: "" }).join(" "), /required/);
+	});
+
+	it("accepts optionFeedback keyed by a real option value", () => {
+		const withFeedback = {
+			...valid,
+			options: [
+				{ label: "Venus", value: "venus" },
+				{ label: "Mercury", value: "mercury" },
+			],
+			correctAnswer: "mercury",
+			optionFeedback: [{ value: "mercury", right: "Closest orbit." }],
+		};
+		assert.deepEqual(quizInputProblems(withFeedback), []);
+		assert.equal(boundaryOk(quizInputSchema, withFeedback, quizInputProblems(withFeedback)), true);
+	});
+
+	it("a stale optionFeedback key does not reject an otherwise gradeable quiz", () => {
+		const stale = {
+			...valid,
+			options: [
+				{ label: "Venus", value: "venus" },
+				{ label: "Mercury", value: "mercury" },
+			],
+			correctAnswer: "mercury",
+			optionFeedback: [{ value: "mars", wrong: "Not closest." }],
+		};
+		assert.deepEqual(quizInputProblems(stale), []);
+		assert.equal(boundaryOk(quizInputSchema, stale, quizInputProblems(stale)), true);
+	});
+
+	it("is lenient about a missing wrong/right on an optionFeedback entry", () => {
+		const bare = { ...valid, optionFeedback: [{ value: "Venus" }] };
+		assert.deepEqual(quizInputProblems(bare), []);
+	});
+
+	it("the display parse heals a JSON-string-encoded optionFeedback array", () => {
+		const encoded = JSON.stringify([{ value: "Venus", wrong: "Not closest." }, { value: "Mercury", right: "Closest orbit." }]);
+		const parsed = parseQuizInput({
+			question: valid.question,
+			options: [{ label: "Venus" }, { label: "Mercury" }],
+			correctAnswer: "Mercury",
+			explanation: valid.explanation,
+			optionFeedback: encoded,
+		});
+		assert.ok(parsed, "a string-encoded array still parses at the display seam");
+		assert.deepEqual(parsed!.optionFeedback, JSON.parse(encoded));
+	});
+
+	it("the display parse keeps a stale feedback key for the consumer to drop", () => {
+		const parsed = parseQuizInput({
+			question: valid.question,
+			options: [{ label: "Venus" }, { label: "Mercury" }],
+			correctAnswer: "Mercury",
+			explanation: valid.explanation,
+			optionFeedback: [{ value: "mars", wrong: "Not closest." }],
+		});
+		assert.deepEqual(parsed?.optionFeedback, [{ value: "mars", wrong: "Not closest." }]);
 	});
 });
 
@@ -455,6 +513,16 @@ describe("buildAnswer", () => {
 	it("grades a wrong selection", () => {
 		const ad = buildAnswer(quizData(), { values: ["venus"] });
 		assert.equal(ad.correct, false);
+	});
+
+	it("snapshots optionFeedback on quiz answers when present", () => {
+		const optionFeedback = [
+			{ value: "mercury", right: "Closest orbit." },
+			{ value: "venus", wrong: "Brightness is not distance." },
+		];
+		const ad = buildAnswer(quizData({ optionFeedback }), { values: ["venus"] });
+		assert.deepEqual(ad.optionFeedback, optionFeedback);
+		assert.equal(buildAnswer(quizData(), { values: ["venus"] }).optionFeedback, undefined);
 	});
 
 	it("dontKnow is never correct and records no answers", () => {

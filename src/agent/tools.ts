@@ -67,12 +67,17 @@ export type { ProbeDoneContext } from "./tools/probe.ts";
  *  honestly and the agent retries with a real error to learn from. */
 function prepareQuestionArguments<T extends object>(args: unknown): T {
 	if (args && typeof args === "object" && !Array.isArray(args)) {
-		const o = args as { options?: unknown };
+		const o = args as { options?: unknown; optionFeedback?: unknown };
+		let prepared = o;
 		if (typeof o.options === "string") {
 			const parsed = parseOptionsIfString(o.options);
-			if (parsed !== o.options) return { ...o, options: parsed } as T;
+			if (parsed !== o.options) prepared = { ...prepared, options: parsed };
 		}
-		return o as T;
+		if (typeof o.optionFeedback === "string") {
+			const parsed = parseOptionsIfString(o.optionFeedback);
+			if (parsed !== o.optionFeedback) prepared = { ...prepared, optionFeedback: parsed };
+		}
+		return prepared as T;
 	}
 	return args as T;
 }
@@ -132,6 +137,23 @@ export const quizExampleBody = {
 		{ label: "$2\\cos(2x)$", value: "b" },
 		{ label: "$3\\cos(2x)$", value: "c" },
 	],
+	optionFeedback: [
+		{
+			value: "a",
+			wrong: "You kept the sine's slope but missed one link in the chain: differentiate $2x$ before multiplying by $\\frac{dx}{dt}=3$.",
+			right: "You chained both links: $\\sin(2x)$ gives $2\\cos(2x)$ and the rate $\\frac{dx}{dt}=3$ scales it to $6\\cos(2x)$.",
+		},
+		{
+			value: "b",
+			wrong: "You applied the inner factor $2$ but forgot that the phase also moves at $\\frac{dx}{dt}=3$; the two multiply.",
+			right: "You tracked the inner derivative and the phase rate together, so the double speed carries through to the chain rule.",
+		},
+		{
+			value: "c",
+			wrong: "You carried the rate $\\frac{dx}{dt}=3$ but dropped the $2$ from differentiating $2x$; both factors belong.",
+			right: "You saw that the rate and the inner derivative multiply, giving $6$ rather than either factor alone.",
+		},
+	],
 	explanation:
 		"The phase changes twice as fast as $x$; multiply by the sine's slope:\n$$\n\\frac{dy}{dt}=\\cos(2x)\\cdot2\\cdot3=6\\cos(2x)\n$$",
 	correctAnswer: "a",
@@ -148,7 +170,8 @@ function quizDescription(delta: { name: "quiz" | "probe"; nodeId: boolean; types
 		delta.name +
 		" always has a " +
 		"correct answer supplied by you, marks the learner's selection right/wrong, reveals the correct answer, and " +
-		"can show an explanation. Options-only: single-select or multi-select, plus an automatic 'I don't know' " +
+		"can show an explanation. For each option, supply `optionFeedback`: a note on why a wrong choice is tempting " +
+		"and wrong, and what a correct confident choice means. Options-only: single-select or multi-select, plus an automatic 'I don't know' " +
 		"choice so the learner can signal a genuine gap instead of guessing. An always-present optional thinking " +
 		"field lets the learner attach his reasoning to ANY answer; it reaches you only when non-empty. " +
 		"No free-text answers — for non-graded questions use ask_user_question instead. " +

@@ -1,7 +1,7 @@
 /** Read-only provenance for historical question cards. Never persist this
  * projection: answer identities, ordering, grading, and learner text remain
  * the recorded facts; only model-authored display text comes from the call. */
-import { normalizeOptions, type QuestionAnswerData } from "./question-core.ts";
+import { filterOptionFeedback, normalizeOptions, type QuestionAnswerData } from "./question-core.ts";
 import { parseAskInput, parseExplainInput, parseQuizInput } from "./tool-parts.ts";
 import { repairMathForDisplay } from "./math-delims.ts";
 
@@ -13,6 +13,9 @@ export function answerForPresentation(answer: QuestionAnswerData, input: unknown
 	if (!source) return answer;
 	const projected = { ...answer, questionText: source.question };
 	if (quiz) projected.explanation = quiz.explanation;
+	if (quiz?.optionFeedback) {
+		projected.optionFeedback = filterOptionFeedback(quiz.optionFeedback, normalizeOptions(quiz.options).map((o) => o.value));
+	}
 	if (explain) projected.committed = explain.correctAnswer;
 	if (!answer.options?.length || !("options" in source) || !source.options?.length) return projected;
 
