@@ -20,6 +20,7 @@ import {
 	CONFIDENCE_STOPS,
 	DEFAULT_CONFIDENCE_INDEX,
 	emptyDockSelection,
+	filterOptionFeedback,
 	normalizeOptions,
 	resolveCorrect,
 	seededRandom,
@@ -326,6 +327,9 @@ function QuestionDockForm({
 			if (resolved.error) console.error("[quiz] correctAnswer did not resolve:", resolved.error);
 			q.correctIndices = resolved.indices;
 			q.explanation = quizInput.explanation;
+			if (quizInput.optionFeedback) {
+				q.optionFeedback = filterOptionFeedback(quizInput.optionFeedback, ordered.map((o) => o.value));
+			}
 		}
 		if (explainInput) {
 			// The commitment rides the question data (never sent to the

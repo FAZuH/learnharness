@@ -10,7 +10,7 @@ import { PathText } from "@/components/file-path-chip";
 import { cn } from "@/lib/utils";
 import { ToolContentResponse } from "@/components/ai-elements/message";
 import type { QuestionAnswerData } from "@/src/core";
-import { answerForPresentation, parseAskInput, parseQuizInput } from "@/src/core";
+import { CONFIDENT_ANSWER_MIN, answerForPresentation, parseAskInput, parseQuizInput } from "@/src/core";
 
 /**
  * Static rendering of an answered question (tool part in `output-available`).
@@ -46,6 +46,24 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 	const askInput = answer.kind === "ask" ? parseAskInput(input) : undefined;
 	const parsedDetails = askInput?.details ?? (answer.kind === "quiz" ? parseQuizInput(input)?.details : undefined);
 	const descByIndex = new Map((askInput?.options ?? []).map((o, i) => [i + 1, o.description]));
+
+	// Per-option notes authored at pose time, keyed by option index so each
+	// note renders inside its own selected option box.
+	type OptionNote = { kind: "wrong" | "right"; text: string };
+	const noteByIndex = new Map<number, OptionNote>();
+	if (isQuiz) {
+		for (const a of answer.answers) {
+			const entry = answer.optionFeedback?.find((f) => f.value === a.value);
+			if (!entry) continue;
+			if (correctIdx.has(a.index)) {
+				if ((answer.confidence ?? 0) >= CONFIDENT_ANSWER_MIN && entry.right) {
+					noteByIndex.set(a.index, { kind: "right", text: entry.right });
+				}
+			} else if (entry.wrong) {
+				noteByIndex.set(a.index, { kind: "wrong", text: entry.wrong });
+			}
+		}
+	}
 
 	return (
 		<>
@@ -105,6 +123,7 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 					{answer.options?.map((opt) => {
 						const sel = selectedIdx.has(opt.index);
 						const key = isQuiz && correctIdx.has(opt.index);
+						const note = noteByIndex.get(opt.index);
 						return (
 							<div
 								key={opt.index}
@@ -143,6 +162,13 @@ export function AnsweredCard({ answer: savedAnswer, input }: { answer: QuestionA
 										<ToolContentResponse className="lh-prose block text-xs text-muted-foreground">
 											{descByIndex.get(opt.index)}
 										</ToolContentResponse>
+									)}
+									{note && (
+										<div data-testid="option-feedback" data-feedback-kind={note.kind}>
+											<ToolContentResponse className="lh-prose block text-xs text-muted-foreground">
+												{note.text}
+											</ToolContentResponse>
+										</div>
 									)}
 								</span>
 							</div>

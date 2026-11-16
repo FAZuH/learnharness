@@ -30,6 +30,11 @@ export interface QuizOption {
 	description?: string;
 }
 
+/** Pre-authored feedback for one quiz option, keyed by that option's exact
+ *  `value`. `wrong` is shown when the option is picked and the answer is
+ *  wrong; `right` when it is picked, correct, and held with confidence. */
+export type QuizOptionFeedback = { value: string; wrong?: string; right?: string };
+
 // ─── tool input schemas (the question contract) ─────────────────────────────
 // Parameter names mirror the prompt docs exactly — keep them in sync.
 
@@ -53,6 +58,26 @@ const askOptionProps = {
 	...quizOptionProps,
 	description: Type.Optional(
 		Type.String({ description: "Optional extra detail shown below the option" }),
+	),
+};
+
+/** Per-option reading material written while the question is composed, so
+ *  the answered card can show it instantly without another agent turn. */
+const quizOptionFeedbackProps = {
+	value: Type.String({
+		description: "The exact `value` of the option this feedback is about. Copy it from that option.",
+	}),
+	wrong: Type.Optional(
+		Type.String({
+			description:
+				"Shown when this option is chosen and it is WRONG: why it is wrong and the tempting trap that leads people to it.",
+		}),
+	),
+	right: Type.Optional(
+		Type.String({
+			description:
+				"Shown when this option is chosen and it is CORRECT with high confidence: what the learner just understood and how it connects to the bigger picture.",
+		}),
 	),
 };
 
@@ -115,9 +140,11 @@ export function quizInputProblems(input: {
 	options: Array<{ label: string; value?: string }>;
 	correctAnswer: string | string[];
 	multiSelect?: boolean;
+	optionFeedback?: Array<{ value: string }>;
 }): string[] {
 	const { problems, keys } = optionProblems(input.options);
 
+	// A stale feedback key can never match a selected answer; consumers drop it.
 	// Preserve exact option keys before trying copy-syntax cleanup — the
 	// same option-aware coercion runs at the display and grading seams.
 	const entries = coerceCorrectAnswer(input.correctAnswer, keys);
@@ -141,6 +168,18 @@ export function quizInputProblems(input: {
 		);
 	}
 	return problems;
+}
+
+/** Keep only feedback whose key resolves to an option value. A stale or
+ *  malformed key yields no note instead of rejecting the whole question. */
+export function filterOptionFeedback<T extends { value: string }>(
+	feedback: T[] | undefined,
+	optionValues: readonly string[],
+): T[] | undefined {
+	if (!Array.isArray(feedback)) return undefined;
+	const values = new Set(optionValues);
+	const kept = feedback.filter((entry) => entry != null && typeof entry.value === "string" && values.has(entry.value));
+	return kept.length > 0 ? kept : undefined;
 }
 
 // The SHARED quiz authoring fields — everything except `nodeId`. The probe
@@ -170,6 +209,15 @@ export const quizInputBase = Type.Object({
 			"Give each option a stable `value`; you reference the correct one by that value in correctAnswer. " +
 			"Never add your own 'I don't know' option — that choice is added for you.",
 	}),
+	optionFeedback: Type.Optional(
+		Type.Array(Type.Object(quizOptionFeedbackProps), {
+			description:
+				"Optional pre-written feedback, one entry PER option keyed by its exact `value`, written here while " +
+				"you compose the options. For a wrong option, say why it is wrong and name the trap that leads " +
+				"people to it; for the correct option, say what a confident right pick means and how it connects " +
+				"to the bigger picture. The card shows the matching note the instant the learner answers.",
+		}),
+	),
 	multiSelect: Type.Optional(
 		Type.Boolean({
 			description: "Set to true when more than one option is correct and the learner must select all of them.",
@@ -429,6 +477,8 @@ export interface QuestionData {
 	committedAnswer?: string;
 	// quiz only (the MC "why"). NEVER send to the client before answering:
 	explanation?: string;
+	// quiz only. Pre-authored per-option notes, snapshotted into the answer.
+	optionFeedback?: QuizOptionFeedback[];
 	createdAt: string;
 }
 
@@ -471,6 +521,7 @@ export interface QuestionAnswerData {
 	correctIndices?: number[]; // quiz only (rendering)
 	committed?: string; // explain only (rendering): the model's committed answer
 	explanation?: string; // quiz only (rendering)
+	optionFeedback?: QuizOptionFeedback[]; // quiz only (rendering)
 	dismissed?: boolean;
 	answeredAt: string;
 }
@@ -503,6 +554,8 @@ export interface AnswerRequest {
  *  resting default — untouched and deliberate 50 are the same number. */
 export const CONFIDENCE_STOPS: readonly number[] = [0, 30, 50, 70, 90, 100];
 export const DEFAULT_CONFIDENCE_INDEX = 2;
+/** Confidence at or above this counts as "sufficient" for the right-option note. */
+export const CONFIDENT_ANSWER_MIN = 70;
 
 // ─── dock selection (the client state machine, pure for tests) ─────────────
 
@@ -738,6 +791,7 @@ export function buildAnswer(qd: QuestionData, req: AnswerRequest, tool?: string)
 	if (qd.kind === "quiz") {
 		base.correctIndices = qd.correctIndices ?? [];
 		base.explanation = qd.explanation;
+		if (qd.optionFeedback) base.optionFeedback = qd.optionFeedback;
 		base.correct = base.dontKnow ? false : isCorrect(base.answers.map((a) => a.index), qd.correctIndices ?? []);
 		// The confidence slider rides on real quiz answers only — never on
 		// "I don't know" (no answer, no probability). Clamped defensively;
