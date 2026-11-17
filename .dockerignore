@@ -1,0 +1,19 @@
+.git
+.github
+.next
+**/node_modules
+core-plugins
+dist
+data
+auth.json
+auth.json.*
+chatgpt-credentials.json*
+github-copilot-credentials.json*
+xai-credentials.json*
+.env
+.env.*
+**/.npmrc
+*.log
+.DS_Store
+# docs/ and skills/ are build inputs for build-plugin-authoring.mjs; do not exclude.
+# src/agent/prompts/**/*.md are runtime assets; build-server.mjs checks for them.

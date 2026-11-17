@@ -1,0 +1,27 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      # Loopback by default. Change 127.0.0.1 to 0.0.0.0 to expose on the LAN.
+      - "127.0.0.1:3000:3000"
+    environment:
+      LH_DATA_DIR: /data
+      LH_AUTH_FILE: /data/auth.json
+      LH_ALLOWED_HOSTS: ${LH_ALLOWED_HOSTS:-localhost}
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - lh-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  lh-data:
