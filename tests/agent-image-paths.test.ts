@@ -339,12 +339,13 @@ for (const forced of [false, true]) {
 		const { engine, requests } = scripted(steps);
 		const activity: string[] = [];
 		const result = await runVisualMaker({ brief: "One synthetic figure." }, { engine, headless, onActivity: (line) => activity.push(line) });
-		assert.equal(requests.length, 2);
+		assert.equal(requests.length, 4);
 		assert.ok(requests.every((request) => images(request).length === 0));
 		assert.equal(result.svg, "");
-		assert.match(result.notes!, /^FAILED: inspecting the final SVG failed/);
+		assert.match(result.notes!, /FAILED: inspecting the final SVG failed/);
+		assert.match(result.notes!, /Gave up after 3 attempts/);
 		assert.match(result.notes!, /Image omitted:/);
-		assert.ok(!activity.some((line) => line.includes("inspecting")), "a failed image is never marked inspected");
+		assert.ok(!activity.some((line) => line.includes("inspecting final render")), "a failed image never reaches the final-render inspection gate");
 		assert.equal(svgCalls.length, forced ? 1 : 2, "an explicit processing failure leaves the final-SVG gate unsatisfied");
 		if (!forced) assert.match(text(requests[1]!), /RENDER ERROR.*Image omitted:/);
 	});

@@ -51,10 +51,14 @@ function setup(t: TestContext, selection = "auditor") {
 	t.after(() => { backgroundCaptureDir.current = previous; delete process.env.LH_BACKGROUND_CAPTURE; });
 	return dir;
 }
-function readCapture(dir: string) {
-	const files = fs.readdirSync(dir);
-	assert.equal(files.length, 1, "Only one final file, never earlier requests or temporary files");
-	return JSON.parse(fs.readFileSync(path.join(dir, files[0]!), "utf8"));
+function readCapture(dir: string, expected = 1) {
+	const files = fs.readdirSync(dir)
+		.map((name) => ({ name, mtime: fs.statSync(path.join(dir, name)).mtimeMs }))
+		.sort((a, b) => a.mtime - b.mtime);
+	assert.equal(files.length, expected, expected === 1
+		? "Only one final file, never earlier requests or temporary files"
+		: `Expected ${expected} capture files`);
+	return JSON.parse(fs.readFileSync(path.join(dir, files[0]!.name), "utf8"));
 }
 function sse(toolName: string, thinking: string, modelId = model.id) {
 	const chunk = {
@@ -327,7 +331,7 @@ for (const role of ["pdfReader", "visualMaker"] as const) {
 			? await runPdfReaderAgent({ path: path.join(import.meta.dirname, "fixtures/sample-3page.pdf"), question: "Fixture?" }, opts)
 			: await runVisualMaker({ brief: "Fixture" }, opts);
 		assert.match(JSON.stringify(result), /waiting for response headers/);
-		const record = readCapture(dir);
+		const record = readCapture(dir, role === "pdfReader" ? 1 : 3);
 		assert.equal(record.request.turn, 2);
 		assert.equal(record.response.message.stopReason, "error");
 		assert.match(record.error.message, /waiting for response headers/);

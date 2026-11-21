@@ -644,7 +644,7 @@ describe("append-only main-request delivery", () => {
 		assert.match(chatStore.getChat(f.chatId)!.sideChats![0]!.messages.at(-1)!.error!, /Not dispatched/);
 	});
 
-	it("sends a namespaced routing session for opencode-go only", async () => {
+	it("sends a namespaced routing session for opencode-go and the chat id otherwise", async () => {
 		const f = fixture();
 		const sessions: (string | undefined)[] = [];
 		const engineFor = (provider: string): PiEngine => ({
@@ -664,6 +664,6 @@ describe("append-only main-request delivery", () => {
 		const other = createSideChatService({ chatStore, instructions: () => "Helper", engineFor: async () => engineFor("openrouter") });
 		await (await other.ask(f.chatId, { threadId: "side_explanation", text: "Follow-up", quotes: [] })).text();
 		await other.settled(f.chatId, "side_explanation");
-		assert.equal(sessions.at(-1), undefined);
+		assert.equal(sessions.at(-1), f.chatId);
 	});
 });

@@ -34,7 +34,7 @@ export interface DemoBuilderOptions {
 	/** Test seam: scripted engine; production uses the demoBuilder role. */
 	engine?: PiEngine;
 	headless?: HeadlessApi;
-	/** Max agent steps (each write/run/fix is one step). Default 24 ≈ 6 cycles. */
+	/** Optional assistant-turn cap; omitted = no turn-count limit. */
 	maxSteps?: number;
 	/** Total build attempts when the result is a failure (no HTML written or
 	 *  the final headless verification failed). Each retry starts a fresh
@@ -270,7 +270,7 @@ async function attemptDemoBuilder(
 			engine: opts.engine,
 			systemPrompt: INSTRUCTIONS,
 			prompt,
-			maxTurns: opts.maxSteps ?? 24,
+			maxTurns: opts.maxSteps,
 			abortSignal: opts.abortSignal,
 			onUsage: (usage) => opts.onUsage?.(usage),
 			onToolStart: (toolName) => opts.onActivity?.(toolName),
